@@ -33,7 +33,7 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPVisionModelWithProjection
 
-from src.dataset.dance_video import HumanDanceVideoDataset, environment_formulation_inf
+from src.dataset.dance_video import HumanDanceVideoDataset, HumanVideoDataset, environment_formulation_inf
 from src.models.mutual_self_attention import ReferenceAttentionControl
 from src.models.pose_guider import PoseGuider, PoseModulation
 from src.models.unet_2d_condition import UNet2DConditionModel
@@ -445,7 +445,7 @@ def main(cfg):
         * cfg.solver.gradient_accumulation_steps,
     )
 
-    train_dataset = HumanDanceVideoDataset(
+    train_dataset = HumanVideoDataset(
         width=cfg.data.train_width,
         height=cfg.data.train_height,
         n_sample_frames=cfg.data.n_sample_frames,
