@@ -118,7 +118,7 @@ class Pose2VideoPipeline(DiffusionPipeline):
             text_encoder=text_encoder,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
-        self.clip_image_processor = CLIPImageProcessor()
+
         self.ref_image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True
         )
@@ -427,18 +427,11 @@ class Pose2VideoPipeline(DiffusionPipeline):
         batch_size = 1
 
         # Prepare clip image embeds
-        clip_image = self.clip_image_processor.preprocess(
-            ref_image.resize((224, 224)), return_tensors="pt"
-        ).pixel_values
-        clip_image_embeds = self.image_encoder(
-            clip_image.to(device, dtype=self.image_encoder.dtype)
-        ).image_embeds
-        encoder_hidden_states = clip_image_embeds.unsqueeze(1)
-        uncond_encoder_hidden_states = torch.zeros_like(encoder_hidden_states)
+        uncond_encoder_hidden_states = torch.zeros((1, 1, 768), device=device)
 
         if do_classifier_free_guidance:
             encoder_hidden_states = torch.cat(
-                [uncond_encoder_hidden_states, encoder_hidden_states], dim=0
+                [uncond_encoder_hidden_states, uncond_encoder_hidden_states], dim=0
             )
 
         reference_control_writer = ReferenceAttentionControl(
@@ -463,7 +456,7 @@ class Pose2VideoPipeline(DiffusionPipeline):
             width,
             height,
             video_length,
-            clip_image_embeds.dtype,
+            self.vae.dtype,
             device,
             generator,
         )
