@@ -5,6 +5,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+class InflatedMultiheadAttention(nn.MultiheadAttention):
+    def forward(self, query, key, value, key_padding_mask=None, need_weights=True, attn_mask=None, average_weights=True, is_cached=False):
+        batch_size, num_channel, video_length, height, width = query.shape
+
+        query = rearrange(query, "b c f h w -> (h w) (b f) c")
+        key = rearrange(key, "b c f h w -> (h w) (b f) c")
+        value = rearrange(value, "b c f h w -> (h w) (b f) c")
+        x = super().forward(query, key, value, key_padding_mask=key_padding_mask, need_weights=need_weights, attn_mask=attn_mask, is_cached=is_cached)
+        x = rearrange(x, "(h w) (b f) c -> b c f h w", h=height, f=video_length)
+
+        return x
 
 class InflatedConv3d(nn.Conv2d):
     def forward(self, x):

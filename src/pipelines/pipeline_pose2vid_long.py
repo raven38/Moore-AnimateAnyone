@@ -26,6 +26,56 @@ from src.models.mutual_self_attention import ReferenceAttentionControl
 from src.pipelines.context import get_context_scheduler
 from src.pipelines.utils import get_tensor_interpolation_method
 
+def get_shape_agnostic_mask(mask, kh, kw, x, y, h, w):
+    """
+    mask : torch.Tensor
+        (f, h, w)
+    """
+    block_h = np.ceil(h / kh)
+    block_w = np.ceil(w / kw)
+    _, H, W = mask.shape
+    foreground_mask = mask[:, y:min(y + kh*block_h, H), x:min(x + kw*block_w, W)]
+    _, fh, fw = foreground_mask.shape
+    patch = torch.nn.functional.max_pool2d(foreground_mask, (block_h, block_w)) # (f, kh, kw)
+    agnostic_mask = torch.nn.functional.interpolate(patch, (block_h, block_w), mode="nearest") # repeat_interleaveでもよい
+
+    # paste agnostic_mask to mask
+    mask[:, y:y + fh, x:x + fw] = agnostic_mask[:, :fh, :fw]
+
+    return mask
+
+def get_bbox_from_mask(mask):
+    """
+    mask : torch.Tensor
+        (f, h, w)
+    """
+    f, h, w = mask.shape
+    mask = mask.view(f, -1)
+    x = torch.argmax(mask, dim=1) // w
+    y = torch.argmax(mask, dim=1) % w
+    ymin = torch.min(y)
+    ymax = torch.max(y)
+    xmin = torch.min(x)
+    xmax = torch.max(x)
+    return xmin, ymin, xmax - xmin, ymax - ymin
+
+def environment_formulation_inf(image, mask):
+    """
+    image : torch.Tensor
+        (f, c, h, w)
+    mask : torch.Tensor
+        (f, 1, h, w) or (f, h, w)
+        1 for foreground, 0 for background
+    """
+    x, y, h, w = get_bbox_from_mask(mask)
+    kh = h//10
+    kw = w//10
+    agnostic_mask = get_shape_agnostic_mask(mask, kh, kw, x, y, h, w)
+    agnostic_mask = agnostic_mask.unsqueeze(1)
+    
+    environment_image = image * (1 - agnostic_mask)
+
+    return environment_image
 
 @dataclass
 class Pose2VideoPipelineOutput(BaseOutput):
@@ -339,6 +389,9 @@ class Pose2VideoPipeline(DiffusionPipeline):
         self,
         ref_image,
         pose_images,
+        depth_images,
+        env_images,
+        seg_images,
         width,
         height,
         video_length,
@@ -428,6 +481,37 @@ class Pose2VideoPipeline(DiffusionPipeline):
         ref_image_latents = self.vae.encode(ref_image_tensor).latent_dist.mean
         ref_image_latents = ref_image_latents * 0.18215  # (b, 4, h, w)
 
+        env_cond_tensor_list = []
+        for env_image in env_images:
+            env_cond_tensor = (
+                torch.from_numpy(np.array(env_image.resize((width, height)))) / 255.0
+            )
+            env_cond_tensor_list.append(env_cond_tensor.permute(2, 0, 1).unsqueeze(0)) 
+        env_cond_tensor = torch.cat(env_cond_tensor_list, dim=0)  # (t, c, h, w)
+
+        seg_cond_tensor_list = []
+        for seg_image in seg_images:
+            seg_cond_tensor = (
+                torch.from_numpy(np.array(seg_image.resize((width, height)))) 
+            )
+            seg_cond_tensor_list.append(seg_cond_tensor.permute(2, 0, 1).unsqueeze(0))
+        seg_cond_tensor = torch.cat(seg_cond_tensor_list, dim=0)  # (t, c, h, w)
+
+        mask_tensor = (seg_cond_tensor > 0).any(dim=1).float() # f, h, w
+        env_tensor = environment_formulation_inf(env_tensor, mask_tensor)
+        env_images_tensor = self.cond_image_processor.preprocess(
+            env_tensor, height=height, width=width
+        )
+        env_images_tensor = env_images_tensor.to(
+            dtype=self.vae.dtype, device=self.vae.device
+        )
+        env_images_latents = self.vae.encode(env_images_tensor).latent_dist.mean
+        env_images_latents = env_images_latents * 0.18215  # (t, 4, h, w)
+        video_length = env_images_latents.shape[0]
+        env_images_latents = rearrange(
+            env_images_latents, "(b f) c h w -> b c f h w", f=video_length
+        ) # (b, t, f, h, w)
+
         # Prepare a list of pose condition images
         pose_cond_tensor_list = []
         for pose_image in pose_images:
@@ -440,7 +524,22 @@ class Pose2VideoPipeline(DiffusionPipeline):
         pose_cond_tensor = pose_cond_tensor.to(
             device=device, dtype=self.pose_guider.dtype
         )
-        pose_fea = self.pose_guider(pose_cond_tensor)
+        # Prepare a list of depth condition images
+        depth_cond_tensor_list = []
+        for depth_image in depth_images:
+            depth_cond_tensor = (
+                torch.from_numpy(np.array(depth_image.resize((width, height)))) / 255.0 # これは何で255で割っているのかtrainの方はなくないか?
+            )
+            depth_cond_tensor = depth_cond_tensor.permute(2, 0, 1).unsqueeze(
+                1
+            )
+            depth_cond_tensor_list.append(depth_cond_tensor)
+        depth_cond_tensor = torch.cat(depth_cond_tensor_list, dim=1) # (c, t, h, w)
+        depth_cond_tensor = depth_cond_tensor.unsqueeze(0)
+        depth_cond_tensor = depth_cond_tensor.to(
+            device=device, dtype=self.pose_guider.dtype
+        )        
+        pose_fea = self.pose_guider(pose_cond_tensor, depth_cond_tensor) 
 
         context_scheduler = get_context_scheduler(context_schedule)
 
@@ -527,6 +626,7 @@ class Pose2VideoPipeline(DiffusionPipeline):
                         t,
                         encoder_hidden_states=encoder_hidden_states[:b],
                         pose_cond_fea=latent_pose_input,
+                        env_latents=env_images_latents,
                         return_dict=False,
                     )[0]
 
