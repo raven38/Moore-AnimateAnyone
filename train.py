@@ -352,30 +352,6 @@ def main(cfg):
         conditioning_embedding_channels=320, block_out_channels=(16, 32, 96, 256)
     ).to(device="cuda", dtype=weight_dtype)
 
-    stage1_ckpt_dir = cfg.stage1_ckpt_dir
-    stage1_ckpt_step = cfg.stage1_ckpt_step
-    denoising_unet.load_state_dict(
-        torch.load(
-            os.path.join(stage1_ckpt_dir, f"denoising_unet-{stage1_ckpt_step}.pth"),
-            map_location="cpu",
-        ),
-        strict=False,
-    )
-    reference_unet.load_state_dict(
-        torch.load(
-            os.path.join(stage1_ckpt_dir, f"reference_unet-{stage1_ckpt_step}.pth"),
-            map_location="cpu",
-        ),
-        strict=False,
-    )
-    pose_guider.load_state_dict(
-        torch.load(
-            os.path.join(stage1_ckpt_dir, f"pose_guider-{stage1_ckpt_step}.pth"),
-            map_location="cpu",
-        ),
-        strict=False,
-    )
-
     # Freeze
     vae.requires_grad_(False)
 
@@ -757,6 +733,27 @@ def main(cfg):
                 global_step,
                 total_limit=3,
             )
+            save_checkpoint(
+                unwrap_net.reference_unet,
+                save_dir,
+                "reference_unet",
+                global_step,
+                total_limit=3,
+            )
+            save_checkpoint(
+                unwrap_net.denoising_unet,
+                save_dir,
+                "denoising_unet",
+                global_step,
+                total_limit=3,
+            )
+            save_checkpoint(
+                unwrap_net.pose_guider,
+                save_dir,
+                "pose_guider",
+                global_step,
+                total_limit=3,
+            )            
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
