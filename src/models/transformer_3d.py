@@ -146,11 +146,11 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
             if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
-                    def custom_forward(*inputs):
+                    def custom_forward(*inputs, **kwargs):
                         if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
+                            return module(*inputs, **kwargs, return_dict=return_dict)
                         else:
-                            return module(*inputs)
+                            return module(*inputs, **kwargs)
 
                     return custom_forward
 
@@ -165,6 +165,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                     video_length=video_length,
                     self_attention_additional_feats=self_attention_additional_feats,
                     mode=mode,
+                    use_reentrant=False,
                 )
             else:
 

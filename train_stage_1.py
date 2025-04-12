@@ -390,6 +390,38 @@ def main(cfg):
         * cfg.solver.gradient_accumulation_steps,
     )
 
+    generator = torch.Generator(device=accelerator.device)
+    generator.manual_seed(cfg.seed)
+    # We need to initialize the trackers we use, and also store our configuration.
+    # The trackers initializes automatically on the main process.
+    if True and accelerator.is_main_process:
+        run_time = datetime.now().strftime("%Y%m%d-%H%M")
+        accelerator.init_trackers(
+            cfg.exp_name,
+            init_kwargs={"mlflow": {"run_name": run_time}},
+        )
+        # dump config file
+        mlflow.log_dict(OmegaConf.to_container(cfg), "config.yaml")
+    sample_dicts = log_validation(
+        vae=vae,
+        image_enc=image_enc,
+        net=net,
+        scheduler=val_noise_scheduler,
+        accelerator=accelerator,
+        width=cfg.data.train_width,
+        height=cfg.data.train_height,
+    )   
+    for sample_id, sample_dict in enumerate(sample_dicts):
+        sample_name = sample_dict["name"]
+        img = sample_dict["img"]
+        with TemporaryDirectory() as temp_dir:
+            out_file = Path(
+                f"{temp_dir}/{0:06d}-{sample_name}.gif"
+            )
+            img.save(out_file)
+            mlflow.log_artifact(out_file)     
+
+
     train_dataset = HumanDanceDataset(
         img_size=(cfg.data.train_width, cfg.data.train_height),
         img_scale=(0.9, 1.0),
@@ -421,17 +453,6 @@ def main(cfg):
     num_train_epochs = math.ceil(
         cfg.solver.max_train_steps / num_update_steps_per_epoch
     )
-
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
-    if accelerator.is_main_process:
-        run_time = datetime.now().strftime("%Y%m%d-%H%M")
-        accelerator.init_trackers(
-            cfg.exp_name,
-            init_kwargs={"mlflow": {"run_name": run_time}},
-        )
-        # dump config file
-        mlflow.log_dict(OmegaConf.to_container(cfg), "config.yaml")
 
     # Train!
     total_batch_size = (

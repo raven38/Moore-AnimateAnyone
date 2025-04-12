@@ -1,5 +1,6 @@
 # Adapted from https://github.com/magic-research/magic-animate/blob/main/magicanimate/models/mutual_self_attention.py
 from typing import Any, Dict, Optional
+import traceback
 
 import torch
 from einops import rearrange
@@ -137,7 +138,10 @@ class ReferenceAttentionControl:
                 )
             else:
                 if MODE == "write":
+                    # print("Write mode - Module ID:", id(self))
+                    # print("Before append bank size:", len(self.bank)) 
                     self.bank.append(norm_hidden_states.clone())
+                    # print("After append bank size:", len(self.bank))
                     attn_output = self.attn1(
                         norm_hidden_states,
                         encoder_hidden_states=encoder_hidden_states
@@ -147,6 +151,13 @@ class ReferenceAttentionControl:
                         **cross_attention_kwargs,
                     )
                 if MODE == "read":
+                    # current_stack = traceback.extract_stack()
+                    # print(f"Stack at read - Module ID: {id(self)}")
+                    # for frame in current_stack[-5:]:
+                    #     print(f"  {frame.filename}:{frame.lineno} - {frame.name}")
+                    # print(f"Bank size at read: {len(self.bank)}")                    
+                    # print(f"Read mode - Module ID:, {id(self)} bank size: {len(self.bank)}")                    
+                    # print("Bank before rearrange:", [d.requires_grad for d in self.bank])
                     bank_fea = [
                         rearrange(
                             d.unsqueeze(1).repeat(1, video_length, 1, 1),
@@ -154,6 +165,7 @@ class ReferenceAttentionControl:
                         )
                         for d in self.bank
                     ]
+                    # print("Bank after rearrange:", [d.requires_grad for d in bank_fea])                    
                     modify_norm_hidden_states = torch.cat(
                         [norm_hidden_states] + bank_fea, dim=1
                     )
@@ -336,8 +348,12 @@ class ReferenceAttentionControl:
             writer_attn_modules = sorted(
                 writer_attn_modules, key=lambda x: -x.norm1.normalized_shape[0]
             )
+            # print(len(writer_attn_modules), len(reader_attn_modules))
             for r, w in zip(reader_attn_modules, writer_attn_modules):
+                # print(f"Update - Writer ID: {id(w)}, bank size: {len(w.bank)}")
+                # print(f"Update - Reader ID: {id(r)}, before update bank size: {len(r.bank)}")             
                 r.bank = [v.clone().to(dtype) for v in w.bank]
+                # print(f"Update - Reader ID: {id(r)}, after update bank size: {len(r.bank)}")                
                 # w.bank.clear()
 
     def clear(self):

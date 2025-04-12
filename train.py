@@ -84,23 +84,25 @@ class Net(nn.Module):
         pose_cond_tensor = pose_img.to(device="cuda")
         depth_cond_tensor = depth_img.to(device="cuda")
         pose_fea = self.pose_guider(pose_cond_tensor, depth_cond_tensor)
-
+        encoder_hidden_states = torch.zeros((noisy_latents.shape[0], 1, 768), device="cuda")
         if not uncond_fwd:
             ref_timesteps = torch.zeros_like(timesteps)
+
             self.reference_unet(
                 ref_image_latents,
                 ref_timesteps,
+                encoder_hidden_states,
                 return_dict=False,
             )
             self.reference_control_reader.update(self.reference_control_writer)
-
+                
         model_pred = self.denoising_unet(
             noisy_latents,
             timesteps,
+            encoder_hidden_states,
             pose_cond_fea=pose_fea,
             env_latents=env_latents,
         ).sample
-
         return model_pred
 
 
@@ -154,8 +156,9 @@ def log_validation(
     if generator is None:
         generator = torch.manual_seed(42)
     tmp_denoising_unet = copy.deepcopy(denoising_unet)
-    tmp_denoising_unet = tmp_denoising_unet.to(dtype=torch.float16)
-
+    vae = vae.to(dtype=torch.float32)
+    # tmp_denoising_unet = tmp_denoising_unet.to(dtype=torch.float16)
+    
     pipe = Pose2VideoPipeline(
         vae=vae,
         reference_unet=reference_unet,
@@ -229,9 +232,10 @@ def log_validation(
 
         seg_list = []
         seg_tensor_list = []
-        seg_images = read_frames(seg_video_path)
+        # seg_images = read_frames(seg_video_path)
+        seg_images = read_frames(depth_video_path)
         seg_transform = transforms.Compose(
-            [transforms.Resize((height, width)), transforms.ToTensor()]
+            [transforms.Resize((height, width)), transforms.PILToTensor()]
         )
 
         for seg_image_pil in seg_images[:clip_length]:
@@ -240,9 +244,9 @@ def log_validation(
 
         seg_tensor = torch.stack(seg_tensor_list, dim=0)  # (f, c, h, w)
         
-
-        mask_tensor = (seg_tensor > 0).any(dim=1).float() # f, h, w
+        mask_tensor = (seg_tensor != 100).any(dim=1).float() # f, h, w
         env_tensor = environment_formulation_inf(env_tensor, mask_tensor)
+        env_tensor = env_tensor.transpose(0, 1)
 
         pipeline_output = pipe(
             ref_image_pil,
@@ -266,6 +270,8 @@ def log_validation(
         video = torch.cat([video, env_tensor, pose_tensor, depth_tensor], dim=0)
 
         results.append({"name": f"{ref_name}_{pose_name}", "vid": video})
+
+    vae = vae.to(dtype=torch.float16)
 
     del tmp_denoising_unet
     del pipe
@@ -331,13 +337,12 @@ def main(cfg):
     sched_kwargs.update({"beta_schedule": "scaled_linear"})
     train_noise_scheduler = DDIMScheduler(**sched_kwargs)
 
-    vae = AutoencoderKL.from_pretrained(cfg.vae_model_path).to(
-        "cuda", dtype=weight_dtype
-    )
+    vae = AutoencoderKL.from_pretrained(cfg.vae_model_path).to("cuda", dtype=weight_dtype)
+
     reference_unet = UNet2DConditionModel.from_pretrained(
         cfg.base_model_path,
         subfolder="unet",
-    ).to(device="cuda", dtype=weight_dtype)
+    ).to(device="cuda")
 
     denoising_unet = UNet3DConditionModel.from_pretrained_2d(
         cfg.base_model_path,
@@ -350,13 +355,18 @@ def main(cfg):
 
     pose_guider = PoseModulation(
         conditioning_embedding_channels=320, block_out_channels=(16, 32, 96, 256)
-    ).to(device="cuda", dtype=weight_dtype)
+    ).to(device="cuda")
 
     # Freeze
     vae.requires_grad_(False)
 
     denoising_unet.requires_grad_(True)
     # Set motion module learnable
+    for name, param in denoising_unet.named_parameters():    
+        if 'conv_out.bias' in name:
+            # param.data.mul_(0)
+            print(name, param.mean())
+            
     for name, module in denoising_unet.named_modules():
         if "motion_modules" in name:
             for params in module.parameters():
@@ -365,7 +375,7 @@ def main(cfg):
         if "up_blocks.3" in name:
             param.requires_grad_(False)
         else:
-            param.requires_grad_(True)                
+            param.requires_grad_(True)        
     pose_guider.requires_grad_(True)
 
     reference_control_writer = ReferenceAttentionControl(
@@ -380,6 +390,18 @@ def main(cfg):
         mode="read",
         fusion_blocks="full",
     )
+    # def backward_hook(name):
+    #     def hook(module, grad_input, grad_output):
+    #         print(f"Backward pass through {name}")
+    #         if grad_input[0] is None:
+    #             print(f"Warning: {name} received None gradient")
+    #         else:
+    #             print(f"{name} gradient magnitude: {grad_input[0].abs().mean()}")
+    #     return hook
+
+    # reference_unet.register_backward_hook(backward_hook("reference_unet"))
+    # denoising_unet.register_backward_hook(backward_hook("denoising_unet"))
+    # pose_guider.register_backward_hook(backward_hook("pose_guider"))
 
     net = Net(
         reference_unet,
@@ -535,12 +557,13 @@ def main(cfg):
         disable=not accelerator.is_local_main_process,
     )
     progress_bar.set_description("Steps")
-
+    noise = None
     for epoch in range(first_epoch, num_train_epochs):
         train_loss = 0.0
         t_data_start = time.time()
         for step, batch in enumerate(train_dataloader):
             t_data = time.time() - t_data_start
+
             with accelerator.accumulate(net):
                 # Convert videos to latent space
                 pixel_values_vid = batch["pixel_values_vid"].to(weight_dtype)
@@ -555,7 +578,7 @@ def main(cfg):
                     )
                     latents = latents * 0.18215
 
-                noise = torch.randn_like(latents)
+                noise = torch.randn_like(latents) # if noise is None else noise
                 if cfg.noise_offset > 0:
                     noise += cfg.noise_offset * torch.randn(
                         (latents.shape[0], latents.shape[1], 1, 1, 1),
@@ -580,7 +603,7 @@ def main(cfg):
                     1, 2
                 )  # (bs, c, f, H, W)
 
-                uncond_fwd = random.random() < cfg.uncond_ratio
+                uncond_fwd = False and random.random() < cfg.uncond_ratio
                 ref_image_list = []
 
                 for batch_idx, ref_img in enumerate(batch["pixel_values_ref_img"]):
@@ -598,7 +621,7 @@ def main(cfg):
                 pixel_values_env = batch["pixel_values_env"].to(weight_dtype)
                 with torch.no_grad():
                     pixel_values_env = rearrange(
-                        pixel_values_env, "b c f h w -> (b f) c h w"
+                        pixel_values_env, "b f c h w -> (b f) c h w"
                     )
                     env_latents = vae.encode(
                         pixel_values_env
@@ -607,10 +630,10 @@ def main(cfg):
                         env_latents, "(b f) c h w -> b c f h w", f=video_length
                     )
                     env_latents = env_latents * 0.18215
-
+                
                 # add noise
                 noisy_latents = train_noise_scheduler.add_noise(
-                    latents, noise, timesteps
+                    latents, noise + env_latents, timesteps
                 )
 
                 # Get the target for loss depending on the prediction type
@@ -635,7 +658,8 @@ def main(cfg):
                     pixel_values_depth,
                     uncond_fwd=uncond_fwd,
                 )
-
+                # print("model pred min/max/mean/std", model_pred.min().item(), model_pred.max().item(), model_pred.mean().item(), model_pred.std().item())
+                # print("target min/max/mean/std", target.min().item(), target.max().item(), target.mean().item(), target.std().item())
                 if cfg.snr_gamma == 0:
                     loss = F.mse_loss(
                         model_pred.float(), target.float(), reduction="mean"
@@ -666,11 +690,37 @@ def main(cfg):
 
                 # Backpropagate
                 accelerator.backward(loss)
+                # for name, param in reference_unet.named_parameters():
+                #     if param.grad is None:
+                #         print(f"No grad for {name}")                
+
+                # for name, param in denoising_unet.named_parameters():
+                #     if param.grad is None:
+                #         print(f"No grad for {name}")                              
+                if False and accelerator.sync_gradients:
+                    # デバッグ用：グラディエントの確認
+                    print("Checking gradients after backward:")
+                    for name, param in net.named_parameters():
+                        # if param.grad is not None and 'conv_out.bias' in name:
+                        #    param.grad.data.mul_(-1)                         
+                        if 'conv_out' not in name:
+                            continue
+                        if 't.conv_out.weight' in name:
+                            print(name, param.data.mean(), param.data.dtype)
+                        if 't.conv_out.bias' in name:
+                            print(name, param.data.mean(), param.data.dtype)
+                        if param.requires_grad:
+                            if param.grad is None:
+                                print(f"Warning: {name} has no gradient")
+                            else:
+                                print(f"{name} gradient magnitude: {param.grad.abs().mean()}, min/max: {param.grad.min()}, {param.grad.max()}, {param.grad.mean()}")
+
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(
                         trainable_params,
                         cfg.solver.max_grad_norm,
                     )
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()

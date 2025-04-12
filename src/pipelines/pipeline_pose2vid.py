@@ -18,56 +18,66 @@ from transformers import CLIPImageProcessor
 
 from src.models.mutual_self_attention import ReferenceAttentionControl
 
+
 def get_shape_agnostic_mask(mask, kh, kw, x, y, h, w):
     """
     mask : torch.Tensor
-        (f, h, w)
+        (h, w)
     """
-    block_h = np.ceil(h / kh)
-    block_w = np.ceil(w / kw)
-    _, H, W = mask.shape
-    foreground_mask = mask[:, y:min(y + kh*block_h, H), x:min(x + kw*block_w, W)]
-    _, fh, fw = foreground_mask.shape
-    patch = torch.nn.functional.max_pool2d(foreground_mask, (block_h, block_w)) # (f, kh, kw)
-    agnostic_mask = torch.nn.functional.interpolate(patch, (block_h, block_w), mode="nearest") # repeat_interleaveでもよい
+    H, W = mask.shape
+    mask = mask.unsqueeze(0).unsqueeze(0) # (1, 1, h, w)
+    block_h = int(np.ceil(h / kh))
+    block_w = int(np.ceil(w / kw))
+    
+    foreground_mask = mask[:, :, y:min(y + kh*block_h, H), x:min(x + kw*block_w, W)]
+    _, _, fh, fw = foreground_mask.shape
+    patch = torch.nn.functional.max_pool2d(foreground_mask, (int(block_h), int(block_w))) # (f, kh, kw)
+    agnostic_mask = torch.nn.functional.interpolate(patch, (fh, fw), mode="nearest") # repeat_interleaveでもよい
 
     # paste agnostic_mask to mask
-    mask[:, y:y + fh, x:x + fw] = agnostic_mask[:, :fh, :fw]
+    mask[:, :, y:y + fh, x:x + fw] = agnostic_mask[:, :, :fh, :fw]
 
     return mask
 
 def get_bbox_from_mask(mask):
     """
     mask : torch.Tensor
-        (f, h, w)
+        (h, w)
     """
-    f, h, w = mask.shape
-    mask = mask.view(f, -1)
-    x = torch.argmax(mask, dim=1) // w
-    y = torch.argmax(mask, dim=1) % w
-    ymin = torch.min(y)
-    ymax = torch.max(y)
-    xmin = torch.min(x)
-    xmax = torch.max(x)
-    return xmin, ymin, xmax - xmin, ymax - ymin
+    h, w = mask.shape
+    vert_mask = mask.sum(dim=0) > 0 # w 
+    hori_mask = mask.sum(dim=1) > 0 # h
 
-def environment_formulation_inf(image, mask):
+    vert_mask_ids = torch.nonzero(vert_mask)
+    hori_mask_ids = torch.nonzero(hori_mask)
+    ymin, ymax = torch.min(vert_mask_ids), torch.max(vert_mask_ids)
+    xmin, xmax = torch.min(hori_mask_ids), torch.max(hori_mask_ids)
+    return int(xmin), int(ymin), int(xmax - xmin), int(ymax - ymin)
+
+def environment_formulation_inf(images, masks):
     """
-    image : torch.Tensor
+    images : torch.Tensor
         (f, c, h, w)
-    mask : torch.Tensor
+    masks : torch.Tensor
         (f, 1, h, w) or (f, h, w)
         1 for foreground, 0 for background
     """
-    x, y, h, w = get_bbox_from_mask(mask)
-    kh = h//10
-    kw = w//10
-    agnostic_mask = get_shape_agnostic_mask(mask, kh, kw, x, y, h, w)
-    agnostic_mask = agnostic_mask.unsqueeze(1)
-    
-    environment_image = image * (1 - agnostic_mask)
+    env_image_list = []
+    for image, mask in zip(images, masks):
+        x, y, h, w = get_bbox_from_mask(mask)
 
-    return environment_image
+        # sample number of block kh, kw from kh in (1, h) and kw in (1, w)
+        kh = h//10
+        kw = w//10
+        agnostic_mask = get_shape_agnostic_mask(mask, kh, kw, x, y, h, w)
+        agnostic_mask = agnostic_mask.squeeze(0).squeeze(0)
+    
+        environment_image = image * (1 - agnostic_mask)
+        env_image_list.append(environment_image)
+
+    environment_images = torch.stack(env_image_list, dim=0)
+    return environment_images
+
 
 @dataclass
 class Pose2VideoPipelineOutput(BaseOutput):
@@ -80,7 +90,6 @@ class Pose2VideoPipeline(DiffusionPipeline):
     def __init__(
         self,
         vae,
-        image_encoder,
         reference_unet,
         denoising_unet,
         pose_guider,
@@ -100,7 +109,6 @@ class Pose2VideoPipeline(DiffusionPipeline):
 
         self.register_modules(
             vae=vae,
-            image_encoder=image_encoder,
             reference_unet=reference_unet,
             denoising_unet=denoising_unet,
             pose_guider=pose_guider,
@@ -117,7 +125,7 @@ class Pose2VideoPipeline(DiffusionPipeline):
         self.cond_image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor,
             do_convert_rgb=True,
-            do_normalize=False,
+            do_normalize=True,
         )
 
     def enable_vae_slicing(self):
@@ -160,6 +168,7 @@ class Pose2VideoPipeline(DiffusionPipeline):
         for frame_idx in tqdm(range(latents.shape[0])):
             video.append(self.vae.decode(latents[frame_idx : frame_idx + 1]).sample)
         video = torch.cat(video)
+        # print("deocede_image min/max: ", video.min(), video.max())
         video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
         video = (video / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
@@ -368,11 +377,11 @@ class Pose2VideoPipeline(DiffusionPipeline):
         batch_size = 1
 
         # Prepare clip image embeds
-        uncond_encoder_hidden_states = torch.zeros((1, 1, 768), device=device)
-
+        uncond_encoder_hidden_states = torch.zeros((batch_size, 1, 768), device=device)
+        encoder_hidden_states = torch.zeros((batch_size, 1, 768), device=device)
         if do_classifier_free_guidance:
             encoder_hidden_states = torch.cat(
-                [uncond_encoder_hidden_states, uncond_encoder_hidden_states], dim=0
+                [uncond_encoder_hidden_states, encoder_hidden_states], dim=0
             )
         reference_control_writer = ReferenceAttentionControl(
             self.reference_unet,
@@ -430,8 +439,9 @@ class Pose2VideoPipeline(DiffusionPipeline):
             seg_cond_tensor_list.append(seg_cond_tensor.permute(2, 0, 1).unsqueeze(0))
         seg_cond_tensor = torch.cat(seg_cond_tensor_list, dim=0)  # (t, c, h, w)
 
-        mask_tensor = (seg_cond_tensor > 0).any(dim=1).float() # f, h, w
-        env_tensor = environment_formulation_inf(env_tensor, mask_tensor)
+        mask_tensor = (seg_cond_tensor != 100).any(dim=1).float() # f, h, w
+        env_tensor = environment_formulation_inf(env_cond_tensor, mask_tensor)
+
         env_images_tensor = self.cond_image_processor.preprocess(
             env_tensor, height=height, width=width
         )
@@ -440,6 +450,7 @@ class Pose2VideoPipeline(DiffusionPipeline):
         )
         env_images_latents = self.vae.encode(env_images_tensor).latent_dist.mean
         env_images_latents = env_images_latents * 0.18215  # (t, 4, h, w)
+
         video_length = env_images_latents.shape[0]
         env_images_latents = rearrange(
             env_images_latents, "(b f) c h w -> b c f h w", f=video_length
@@ -481,7 +492,7 @@ class Pose2VideoPipeline(DiffusionPipeline):
         pose_fea = (
             torch.cat([pose_fea] * 2) if do_classifier_free_guidance else pose_fea
         )
-
+        latents += env_images_latents
         # denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -539,9 +550,10 @@ class Pose2VideoPipeline(DiffusionPipeline):
 
             reference_control_reader.clear()
             reference_control_writer.clear()
-
+        
         # Post-processing
         images = self.decode_latents(latents)  # (b, c, f, h, w)
+        # images = self.decode_latents(env_images_latents)
 
         # Convert to tensor
         if output_type == "tensor":

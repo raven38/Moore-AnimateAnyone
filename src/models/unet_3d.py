@@ -421,7 +421,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         encoder_hidden_states: torch.Tensor,
         class_labels: Optional[torch.Tensor] = None,
         pose_cond_fea: Optional[torch.Tensor] = None,
-        env_latent: Optional[torch.Tensor] = None,
+        env_latents: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
         mid_block_additional_residual: Optional[torch.Tensor] = None,
@@ -501,8 +501,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             emb = emb + class_emb
 
         # pre-process
-        if env_latent is not None:
-            sample = sample + env_latent
+        if False and env_latents is not None:
+            sample = sample + env_latents
         sample = self.conv_in(sample)
         if pose_cond_fea is not None:
             sample = sample + pose_cond_fea
